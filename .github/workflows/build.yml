@@ -7,20 +7,16 @@ on:
   schedule:
     - cron: "30 4 * * *"
 
-  # автосборка при правке списков
+  # каждая опубликованная ревизия основной ветки обновляет ноды
   push:
     branches: [main, master]
-    paths:
-      - "data/**"
-      - "tools/**"
-      - ".github/workflows/build.yml"
 
 permissions:
   contents: write
 
 concurrency:
   group: geodata-build
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -127,12 +123,21 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
+          printf '%s\n' "$GITHUB_SHA" > source-revision.txt
           git init -q
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          RELEASE_URL="https://github.com/${GITHUB_REPOSITORY}.git"
+          if git ls-remote --exit-code "$RELEASE_URL" refs/heads/release; then
+            git fetch --depth=1 "$RELEASE_URL" refs/heads/release
+            git update-ref HEAD FETCH_HEAD
+          else
+            test "$?" = 2
+          fi
           git add -A
+          git diff --cached --quiet && exit 0
           git commit -qm "geodata build from ${GITHUB_SHA:0:7}"
-          git push -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:release
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:release
 
       - name: Итоги сборки
         run: |

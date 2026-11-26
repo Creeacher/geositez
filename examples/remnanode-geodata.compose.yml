@@ -1,0 +1,7 @@
+services:
+  remnanode:
+    volumes:
+      - /opt/remnanode/geodata/custom-geosite.dat:/usr/local/share/xray/custom-geosite.dat:ro
+      - /opt/remnanode/geodata/custom-geoip.dat:/usr/local/share/xray/custom-geoip.dat:ro
+      - /opt/remnanode/geodata/roscom-geosite.dat:/usr/local/share/xray/roscom-geosite.dat:ro
+      - /opt/remnanode/geodata/roscom-geoip.dat:/usr/local/share/xray/roscom-geoip.dat:ro

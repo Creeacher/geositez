@@ -2,7 +2,7 @@
 # remnanode-geodata.sh — качает geodata на сервер с remnanode и подкладывает их Xray.
 #
 # Файлов ЧЕТЫРЕ, из двух источников:
-#   custom-geosite.dat  — наш: ADS, ADS-NETWORKS, SYSTEM, CONNECTIVITY, AI,
+#   custom-geosite.dat  — наш: ADS, ADS-NETWORKS, BLOCK-DOMAINS, SYSTEM, CONNECTIVITY, AI,
 #                         TWITCH-ADS, RU (добавка). Это наша политика роутинга.
 #   custom-geoip.dat    — наш: подсети по категориям из data/geoip (TIKTOK, ...).
 #                         Нужен, когда сервис ловится только по IP, а не по домену.
@@ -32,14 +32,13 @@ UPSTREAM_GEOSITE="${UPSTREAM_GEOSITE:-hydraponique/roscomvpn-geosite}"
 DEST="${DEST:-/opt/remnanode/geodata}"           # где файлы лежат на хосте
 CONTAINER="${CONTAINER:-remnanode}"
 COMPOSE_FILE="${COMPOSE_FILE:-/opt/remnanode/docker-compose.yml}"
-RESTART="${RESTART:-1}"                          # 1 — рестартить ноду при изменении файлов
+RESTART="${RESTART:-1}"                          # 1 — рестартить ноду при новой ревизии
 
 # Что качать: пары "URL|имя файла на диске", через пробел.
 # Если GitHub с сервера не открывается — подставь зеркало jsDelivr:
 #   https://cdn.jsdelivr.net/gh/ВЛАДЕЛЕЦ/РЕПО@release/ИМЯ.dat
 if [ -z "${SOURCES:-}" ]; then
-  SOURCES="https://github.com/${REPO}/releases/latest/download/custom-geosite.dat|custom-geosite.dat"
-  SOURCES="$SOURCES https://github.com/${REPO}/releases/latest/download/custom-geoip.dat|custom-geoip.dat"
+  SOURCES="custom-geosite.dat|custom-geosite.dat custom-geoip.dat|custom-geoip.dat"
   if [ "$UPSTREAM" = "1" ]; then
     SOURCES="$SOURCES https://github.com/${UPSTREAM_GEOIP}/releases/latest/download/geoip.dat|roscom-geoip.dat"
     SOURCES="$SOURCES https://github.com/${UPSTREAM_GEOSITE}/releases/latest/download/geosite.dat|roscom-geosite.dat"
@@ -48,6 +47,8 @@ fi
 
 SELF_PATH="/usr/local/bin/remnanode-geodata.sh"
 XRAY_ASSET_DIR="/usr/local/share/xray"
+STATE_FILE="${DEST}/.source-revision"
+if [ "$RESTART" != 1 ]; then STATE_FILE="${STATE_FILE}.no-restart"; fi
 # ─────────────────────────────────
 
 # имена файлов из SOURCES
@@ -65,38 +66,35 @@ check_repo() {
   esac
 }
 
-# Скачивает один файл во временный, проверяет и кладёт на место.
-# Возвращает 0 если файл изменился, 1 если остался прежним.
+download() {
+  curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 60 -o "$2" "$1" \
+    || die "не скачался $1"
+}
+
 fetch_one() {
-  local url="$1" name="$2" tmp
-  tmp="$(mktemp "${DEST}/.${name}.XXXXXX")"
-
-  if ! curl -fsSL --retry 3 --retry-delay 2 --max-time 120 -o "$tmp" "$url"; then
-    rm -f "$tmp"; die "не скачался $url (репозиторий приватный? неверное имя? нет сети?)"
-  fi
-
+  local url="$1" name="$2" tmp="$3"
+  download "$url" "$tmp"
   # .dat — это protobuf, он всегда начинается с байта 0x0A и не бывает пустым
   if [ ! -s "$tmp" ]; then
-    rm -f "$tmp"; die "$name скачался пустым"
+    die "$name скачался пустым"
   fi
   if [ "$(head -c 1 "$tmp" | od -An -tx1 | tr -d ' ')" != "0a" ]; then
-    rm -f "$tmp"; die "$name не похож на geodata-файл (пришла HTML-страница вместо .dat?)"
+    die "$name не похож на geodata-файл (пришла HTML-страница вместо .dat?)"
   fi
+}
 
-  if [ -f "${DEST}/${name}" ] \
-     && [ "$(sha256sum <"$tmp" | cut -d' ' -f1)" = "$(sha256sum <"${DEST}/${name}" | cut -d' ' -f1)" ]; then
-    rm -f "$tmp"
+install_one() {
+  local tmp="$1" name="$2"
+  if cmp -s "$tmp" "${DEST}/${name}"; then
     log "$name — без изменений"
-    return 1
+    return
   fi
 
   # Пишем содержимое поверх существующего файла (не mv!): файл примонтирован
   # в контейнер bind-mount'ом, и подмена через rename сломала бы монтирование.
   cat "$tmp" >"${DEST}/${name}"
   chmod 0644 "${DEST}/${name}"
-  rm -f "$tmp"
   log "$name — обновлён ($(stat -c%s "${DEST}/${name}") байт)"
-  return 0
 }
 
 restart_node() {
@@ -110,26 +108,63 @@ restart_node() {
   fi
 }
 
-cmd_update() {
+sync_release() (
   need_root; check_repo
   mkdir -p "$DEST"
-  local changed=0 s
-  for s in $SOURCES; do
-    if fetch_one "${s%%|*}" "${s##*|}"; then changed=1; fi
-  done
-  if [ "$changed" = "1" ]; then
-    restart_node
-    log "готово: списки обновлены"
-  else
-    log "готово: всё уже актуально"
+  local mode="$1" release revision applied='' applied_release='' base staging s name url
+  exec 9>"${DEST}/.update.lock"
+  flock -x 9
+  release="$(GIT_TERMINAL_PROMPT=0 timeout 30 git ls-remote --exit-code "https://github.com/${REPO}.git" refs/heads/release)"
+  release="${release%%[[:space:]]*}"
+  [[ "$release" =~ ^[0-9a-f]{40}$ ]] || die "не удалось определить коммит ветки release"
+  if [ -f "$STATE_FILE" ]; then
+    read -r applied applied_release <"$STATE_FILE"
   fi
-}
+  for name in $(source_names); do
+    if [ ! -s "${DEST}/${name}" ]; then applied=''; applied_release=''; break; fi
+  done
+  if [ "$mode" = update ] && [ "$release" = "$applied_release" ]; then
+    return
+  fi
+
+  staging="$(mktemp -d "${DEST}/.stage.XXXXXX")"
+  trap 'rm -rf -- "$staging"' EXIT
+  base="https://raw.githubusercontent.com/${REPO}/${release}"
+  download "${base}/source-revision.txt" "${staging}/revision"
+  revision="$(cat "${staging}/revision")"
+  [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || die "некорректная ревизия в source-revision.txt"
+  if [ "$mode" = update ] && [ "$revision" = "$applied" ]; then
+    printf '%s %s\n' "$revision" "$release" >"${staging}/state"
+    mv -f "${staging}/state" "$STATE_FILE"
+    return
+  fi
+
+  download "${base}/checksums.txt" "${staging}/checksums.txt"
+  for s in $SOURCES; do
+    name="${s##*|}"
+    url="${s%%|*}"
+    if [ "$url" = "$name" ]; then url="${base}/${name}"; fi
+    fetch_one "$url" "$name" "${staging}/${name}"
+  done
+  (cd "$staging" && sha256sum --check --ignore-missing checksums.txt) \
+    || die "контрольные суммы geodata не совпали"
+  for name in $(source_names); do install_one "${staging}/${name}" "$name"; done
+  if [ "$mode" = update ]; then
+    restart_node
+    printf '%s %s\n' "$revision" "$release" >"${staging}/state"
+    mv -f "${staging}/state" "$STATE_FILE"
+    log "применена ревизия $revision"
+  fi
+)
 
 cmd_status() {
   check_repo
   echo "наш репозиторий : $REPO"
   echo "чужие списки    : $([ "$UPSTREAM" = "1" ] && echo "$UPSTREAM_GEOIP + $UPSTREAM_GEOSITE" || echo "отключены (UPSTREAM=0)")"
   echo "каталог         : $DEST"
+  if [ -f "$STATE_FILE" ]; then
+    printf 'ревизия         : %s\n' "$(cut -d' ' -f1 "$STATE_FILE")"
+  fi
   local f
   for f in $(source_names); do
     if [ -f "${DEST}/${f}" ]; then
@@ -165,20 +200,21 @@ EOF
 
   cat >/etc/systemd/system/remnanode-geodata.timer <<'EOF'
 [Unit]
-Description=Раз в час подтягивать свежие geodata-списки
+Description=Проверка опубликованной ревизии geodata для remnanode
 
 [Timer]
-OnBootSec=3min
-OnUnitActiveSec=1h
-RandomizedDelaySec=5min
-Persistent=true
+OnActiveSec=1min
+OnUnitInactiveSec=1min
+AccuracySec=1s
+RandomizedDelaySec=15s
 
 [Install]
 WantedBy=timers.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now remnanode-geodata.timer
+  systemctl enable remnanode-geodata.timer
+  systemctl restart remnanode-geodata.timer
   log "таймер поставлен: systemctl list-timers remnanode-geodata.timer"
 }
 
@@ -187,9 +223,14 @@ cmd_install() {
   command -v docker >/dev/null || die "docker не найден"
   command -v curl   >/dev/null || die "нет curl: apt install -y curl"
 
-  mkdir -p "$DEST"
-  local f s
-  for s in $SOURCES; do fetch_one "${s%%|*}" "${s##*|}" || true; done
+  command -v git    >/dev/null || die "git не найден"
+  local f
+  for f in $(source_names); do
+    if [ ! -s "${DEST}/${f}" ]; then
+      sync_release install
+      break
+    fi
+  done
 
   # положить сам скрипт в /usr/local/bin, чтобы systemd его звал
   if [ "$(readlink -f "$0")" != "$SELF_PATH" ]; then
@@ -225,7 +266,7 @@ cmd_install() {
 
 case "${1:-update}" in
   install) cmd_install ;;
-  update)  cmd_update ;;
+  update)  sync_release update ;;
   status)  cmd_status ;;
   *) die "использование: $0 {install|update|status}" ;;
 esac

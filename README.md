@@ -49,6 +49,7 @@ https://site.com/path/?a=1  # можно вставить и ссылку — в
 |---|---|---|---|
 | `ADS` | `data/geosite/ads.txt` | реклама и трекеры по площадкам + `ADS-NETWORKS` | **BLOCK** |
 | `ADS-NETWORKS` | `data/geosite/ads-networks.txt` | ~5300 доменов рекламных сетей и мобильных ad-SDK | подмешан в `ADS` |
+| `BLOCK-DOMAINS` | `data/geosite/block-domains.txt` | домены из первого правила `BLOCK` профилей NL-1, FI-1 и PL-2 | `ext:custom-geosite.dat:BLOCK-DOMAINS` → BLOCK |
 | `RU` | `data/geosite/ru.txt` | добавка: российские сервисы вне зон `.ru/.su/.рф`, которых нет у roscomvpn | DIRECT (клиент) |
 | `SYSTEM` | `data/geosite/system.txt` | пуши APNs/FCM, обновления ОС, NTP, OCSP | DIRECT (клиент) |
 | `CONNECTIVITY` | `data/geosite/connectivity.txt` | проверка интернета (NCSI, captive portal) | клиент → VPN, нода → DIRECT |
@@ -190,9 +191,15 @@ REPO=Mrzalupa-lolz/geositez sudo -E ./remnanode-geodata.sh install
    и `custom-geoip.dat` плюс `roscom-geoip.dat` и `roscom-geosite.dat` (имена
    нарочно не `geoip.dat`/`geosite.dat`, чтобы не затереть штатные ассеты Xray);
 2. показывает, какие строки добавить в `docker-compose.yml` (монтировать нужно
-   **по одному файлу**, том на всю папку затрёт дефолтные `geosite.dat`/`geoip.dat`);
-3. ставит systemd-таймер `remnanode-geodata.timer` — раз в час проверяет релиз,
-   и **только если файл реально изменился** обновляет его и перезапускает ноду.
+   **по одному файлу**, том на всю папку затрёт дефолтные `geosite.dat`/`geoip.dat`).
+   Для стандартных путей можно положить `examples/remnanode-geodata.compose.yml`
+   рядом с `docker-compose.yml` под именем `docker-compose.override.yml`, затем
+   выполнить `docker compose up -d remnanode` из того же каталога;
+3. ставит `remnanode-geodata.timer`. Примерно раз в минуту таймер проверяет ветку
+   `release`, куда GitHub Actions публикует успешную сборку каждого push в `main`.
+   При новой ревизии `main` скрипт скачивает списки, проверяет контрольные суммы
+   собственных `.dat` и перезапускает контейнер. Повторная сборка той же ревизии
+   проходит без рестарта. Списки roscomvpn подтягиваются вместе с новой ревизией.
 
 Полезное:
 
